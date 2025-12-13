@@ -1,0 +1,13 @@
+numpy
+pandas
+flask
+pygame
+sounddevice
+webrtcvad
+pvporcupine
+faster-whisper
+ctranslate2
+opencv-python
+pyaudio
+protobuf
+soundfile
