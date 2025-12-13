@@ -1,0 +1,4 @@
+{
+    "idf.pythonInstallPath": "/home/akshansh/anaconda3/bin/python",
+    "cmake.sourceDirectory": "/home/akshansh/receptionist/whisper/whisper.cpp/examples/stream.wasm"
+}

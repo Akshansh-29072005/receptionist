@@ -1,0 +1,28 @@
+name: receptionist
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - pandas
+  - flask
+  - pygame
+  - sounddevice
+  - ffmpeg
+  - portaudio
+  - webrtcvad
+  - pvporcupine
+  - cmake
+  - visualstudio
+  - dlib
+  - pip:
+    - faster-whisper
+    - ctranslate2
+    - opencv-python
+    - pyaudio
+    - protobuf
+    - pvporcupine
+    - soundfile
+    - pygame
