@@ -17,6 +17,9 @@ from flask import make_response
 import webbrowser
 import signal
 
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["OMP_NUM_THREADS"] = "8"
+
 # ==============================
 # CONFIGURATION
 # ==============================
@@ -25,6 +28,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Porcupine (only "Hello Robot")
 PORCUPINE_ACCESS_KEY = "2NqhVmHPn6ZyLyqPNygsMDAu2I2Vq5kslZaLZhAUbbBwM1XwJFk5DQ=="  # ← REPLACE THIS!
 HELLO_ROBOT_PPN = os.path.join(BASE_DIR, "models", "hello_en.ppn")
+
+PIPER_PATH = r"C:\piper\piper.exe"
 
 VOICES_DIR = os.path.join(BASE_DIR, "voices")
 MODELS_DIR = os.path.join(BASE_DIR, "models")
@@ -61,6 +66,75 @@ question_queue = queue.Queue()
 tts_queue = queue.Queue()
 wakeword_queue = queue.Queue()
 is_speaking = threading.Event()
+audio_segment_queue = queue.Queue(maxsize=10)
+wake_request_queue = queue.Queue()
+
+# ==============================
+# STATE CONTROLLER (AUTHORITATIVE)
+# ==============================
+
+VALID_TRANSITIONS = {
+    "IDLE": {"CONVO"},
+    "CONVO": {"IDLE"},
+}
+
+def transition_state(new_mode, reason=""):
+    with state_lock:
+        current = state["mode"]
+        if new_mode == current:
+            return False
+
+        allowed = VALID_TRANSITIONS.get(current, set())
+        if new_mode not in allowed:
+            print(f"[STATE] ❌ Illegal transition {current} → {new_mode} ({reason})")
+            return False
+
+        print(f"[STATE] ✅ {current} → {new_mode} ({reason})")
+        state["mode"] = new_mode
+        state["last_activity_time"] = time.time()
+        return True
+    
+def wake_gate_worker():
+    while not stop_event.is_set():
+        try:
+            source, lang, message = wake_request_queue.get(timeout=0.2)
+
+            if is_speaking.is_set():
+                wake_request_queue.task_done()
+                continue
+
+            # Try to enter CONVO
+            if transition_state("CONVO", f"{source} wake"):
+                with state_lock:
+                    state.update({
+                        "language": lang,
+                        "status_ui": "Ask any question",
+                        "last_answer_text": message,
+                        "current_user_name": None,
+                        "last_wake_time": time.time()
+                    })
+                tts_queue.put((message, lang, False))
+
+            wake_request_queue.task_done()
+
+        except queue.Empty:
+            continue
+
+def convo_timeout_worker():
+    while not stop_event.is_set():
+        time.sleep(1)
+        with state_lock:
+            if state["mode"] == "CONVO":
+                idle_for = time.time() - state["last_activity_time"]
+                if idle_for >= CONVO_IDLE_TIMEOUT and not is_speaking.is_set():
+                    print("[CONVO] Timeout → returning to IDLE")
+                    state.update({
+                        "mode": "IDLE",
+                        "status_ui": "Say Hello Robot",
+                        "current_user_name": None,
+                        "last_user_text": "",
+                        "last_answer_text": ""
+                    })
 
 # ==============================
 # GRACEFUL SHUTDOWN
@@ -270,21 +344,18 @@ from difflib import SequenceMatcher
 def hindi_wakeword_handler():
     """Handle Hindi wakeword events safely outside audio callback."""
     while not stop_event.is_set():
+        if is_speaking.is_set():
+            # time.sleep(0.01)
+            continue
         try:
             lang = wakeword_queue.get(timeout=0.2)
             if lang == "hindi":
                 now = time.time()
-                with state_lock:
-                    state.update({
-                        "mode": "CONVO",
-                        "language": "hi",
-                        "status_ui": "Ask any question",
-                        "last_answer_text": "नमस्ते! मैं आपकी क्या मदद कर सकता हूँ?",
-                        "current_user_name": None,
-                        "last_activity_time": time.time(),
-                        "last_wake_time": now
-                    })
-                tts_queue.put(("नमस्ते! मैं आपकी क्या मदद कर सकता हूँ?", "hi", False))
+                wake_request_queue.put((
+                    "hindi",
+                    "hi",
+                    "नमस्ते! मैं आपकी क्या मदद कर सकता हूँ?"
+                ))
                 print("🗣️ Hindi greeting started.")
             wakeword_queue.task_done()
         except queue.Empty:
@@ -310,21 +381,31 @@ def tts_speak(text, lang, clear_after=False):
     if not text.strip(): return
     is_speaking.set()
     model = PRATHAM_MODEL if lang.startswith("hi") else AMY_MODEL
-    out_wav = os.path.join(BASE_DIR, "tmp_tts.wav")
+    out_wav = os.path.abspath(os.path.join(BASE_DIR, "tmp_tts.wav"))
     try:
         subprocess.run(
-            ["piper", "--model", model, "--output_file", out_wav],
+            [
+                PIPER_PATH,
+                "--model", model,
+                "--output_file", out_wav
+            ],
             input=text.encode("utf-8"),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=True,
+            creationflags=subprocess.CREATE_NO_WINDOW
         )
+
         pygame.mixer.init(frequency=22050)
         pygame.mixer.music.load(out_wav)
         pygame.mixer.music.play()
         while pygame.mixer.music.get_busy() and not stop_event.is_set():
             time.sleep(0.05)
         pygame.mixer.quit()
+
+        with state_lock:
+            state["last_activity_time"] = time.time()
+
 
         # ✅ ONLY clear if it's an answer (not greeting)
         if clear_after:
@@ -374,7 +455,8 @@ def wakeword_listener():
         import pvporcupine, pyaudio
         porcupine = pvporcupine.create(
             access_key=PORCUPINE_ACCESS_KEY,
-            keyword_paths=[HELLO_ROBOT_PPN]
+            keyword_paths=[HELLO_ROBOT_PPN],
+            sensitivities=[0.8]
         )
         pa = pyaudio.PyAudio()
         stream = pa.open(
@@ -386,21 +468,22 @@ def wakeword_listener():
         )
         print("[WAKE] Listening for 'Hello Robot'...")
         while not stop_event.is_set():
+            with state_lock:
+                if state["mode"] != "IDLE":
+                    # time.sleep(0.01)
+                    continue
+
             pcm = stream.read(porcupine.frame_length, exception_on_overflow=False)
             pcm = np.frombuffer(pcm, dtype=np.int16)
+            # 🔊 Software gain (safe range)
+            pcm = np.clip(pcm * 1.8, -32768, 32767).astype(np.int16)
             if porcupine.process(pcm) >= 0:
-                now = time.time()
-                with state_lock:
-                    state.update({
-                        "mode": "CONVO",
-                        "language": "en",
-                        "status_ui": "Ask any question",
-                        "last_answer_text": "Hello! How can I help you today?",
-                        "current_user_name": None,
-                        "last_activity_time": time.time(),
-                        "last_wake_time": now
-                    })
-                tts_queue.put(("Hello! How can I help you today?", "en", False))
+                    wake_request_queue.put((
+                        "english",
+                        "en",
+                        "Hello! How can I help you today?"
+                    ))
+
         stream.close()
         pa.terminate()
         porcupine.delete()
@@ -442,25 +525,11 @@ def audio_stream_worker():
                         with state_lock:
                             current_mode = state["mode"]
                         
-                        if current_mode == "IDLE":
-                            # 🔍 ONLY in IDLE: check for Hindi wakeword
-                            try:
-                                # Transcribe in Hindi (faster + more accurate for Hindi)
-                                segments, info = whisper_model.transcribe(
-                                    audio_seg, beam_size=1, language="hi", vad_filter=False
-                                )
-                                text = " ".join(seg.text.strip() for seg in segments).strip()
-                                print(f"[HINDI WAKE] Heard: '{text}'")
-                                
-                                if text and is_hindi_wakeword(text):
-                                    print("✅ Hindi wakeword DETECTED: 'शंकरा मित्र'")
-                                    wakeword_queue.put("hindi")  # Just signal the event
-                                # else: stay silent in IDLE (do nothing)
-                            except Exception as e:
-                                print("[HINDI WAKE] Error:", e)
-                        else:
-                            # 🗣️ In CONVO: send to QA
-                            question_queue.put(("PROCESS_AUDIO", "auto", audio_seg))
+                        try:
+                            audio_segment_queue.put_nowait((current_mode, audio_seg))
+                        except queue.Full:
+                            pass  # Drop audio safely (real-time rule)
+
                     
                     triggered = False
                     voiced_frames = []
@@ -470,6 +539,36 @@ def audio_stream_worker():
                 time.sleep(0.1)
     except Exception as e:
         print(f"[AUDIO] Error: {e}")
+
+def audio_processor_worker():
+    while not stop_event.is_set():
+        if is_speaking.is_set():
+            time.sleep(0.05)
+            continue
+
+        try:
+            mode, audio = audio_segment_queue.get(timeout=0.2)
+
+            # --- IDLE → Hindi wakeword detection ---
+            if mode == "IDLE":
+                try:
+                    segments, _ = whisper_model.transcribe(
+                        audio, beam_size=1, language="hi", vad_filter=False
+                    )
+                    text = " ".join(seg.text.strip() for seg in segments).strip()
+                    if text and is_hindi_wakeword(text):
+                        wakeword_queue.put("hindi")
+                except Exception as e:
+                    print("[AUDIO_PROC][HINDI] Error:", e)
+
+            # --- CONVO → normal QA flow ---
+            elif mode == "CONVO":
+                question_queue.put(("PROCESS_AUDIO", "auto", audio))
+
+            audio_segment_queue.task_done()
+
+        except queue.Empty:
+            continue
 
 # ==============================
 # QA WORKER
@@ -502,7 +601,6 @@ def qa_worker():
             if detected_lang.startswith("hi") and is_english_text(question):
                 detected_lang = "en"
                 print(f"[LANG] Detected as Hindi, but corrected to English: '{question}'")
-            
             with state_lock:
                 state["last_user_text"] = question
                 state["last_activity_time"] = time.time()
@@ -532,7 +630,8 @@ def qa_worker():
                 with state_lock:
                     state["last_answer_text"] = answer
                 
-                tts_queue.put((answer, tts_lang, True))  # ✅ Use detected_lang for TTS
+                # tts_queue.put((answer, tts_lang, True))  # ✅ Use detected_lang for TTS
+                tts_queue.put((answer, tts_lang, False))
             question_queue.task_done()
         except:
             continue
@@ -572,18 +671,19 @@ def face_worker():
                 
                 now = time.time()
                 with state_lock:
-                    if recognized_name and state["mode"] == "IDLE" and now - state["last_face_time"] > 20:
+                    if (
+                        recognized_name
+                        and not is_speaking.is_set()
+                        and state["mode"] == "IDLE"
+                        and now - state["last_face_time"] > 20
+                    ):
                         greet = f"Good day, {recognized_name}! How can I help you?"
-                        state.update({
-                            "mode": "CONVO",
-                            "status_ui": "Ask any question",
-                            "language": "en",
-                            "current_user_name": recognized_name,
-                            "last_answer_text": greet,
-                            "last_face_time": now,
-                            "last_wake_time": now
-                        })
-                        tts_queue.put((greet, "en", False))
+                        wake_request_queue.put((
+                            "face",
+                            "en",
+                            f"Good day, {recognized_name}! How can I help you?"
+                        ))
+
         except:
             pass
 
@@ -853,6 +953,9 @@ def main():
     threading.Thread(target=hindi_wakeword_handler, daemon=True).start()
     threading.Thread(target=wakeword_listener, daemon=True).start()
     threading.Thread(target=audio_stream_worker, daemon=True).start()
+    threading.Thread(target=audio_processor_worker, daemon=True).start()
+    threading.Thread(target=wake_gate_worker, daemon=True).start()
+    threading.Thread(target=convo_timeout_worker, daemon=True).start()
 
     # Auto-open browser
     threading.Thread(target=lambda: (time.sleep(1.5), webbrowser.open("http://127.0.0.1:8000")), daemon=True).start()
