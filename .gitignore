@@ -1,1 +1,3 @@
 models/faster-whisper*.gguf
+models/phi-3-mini*.gguf
+/models
