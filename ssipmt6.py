@@ -157,7 +157,7 @@ from faster_whisper import WhisperModel
 print("[STT] Loading Whisper...")
 whisper_model = WhisperModel(
     WHISPER_LOCAL_DIR if os.path.isdir(WHISPER_LOCAL_DIR) and os.listdir(WHISPER_LOCAL_DIR) else "small",
-    device="cpu",
+    device="cuda",
     compute_type="int8"
 )
 print("[STT] Whisper ready.")

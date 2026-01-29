@@ -10,9 +10,9 @@ llm = Llama(
 def generate_answer(context, question, lang):
     if lang == "hi":
         prompt = f"""
-आप एक कॉलेज रिसेप्शनिस्ट हैं।
+आप श्री शंकराचार्य इंस्टिट्यूट ऑफ़ प्रोफेशनल मैनेजमेंट एंड टेक्नोलॉजी कॉलेज के रिसेप्शनिस्ट हैं।
 केवल दिए गए संदर्भ से उत्तर दें।
-उत्तर 15 शब्दों से कम हो।
+उत्तर 20 शब्दों से कम हो।
 
 संदर्भ:
 {context}
@@ -24,9 +24,10 @@ def generate_answer(context, question, lang):
 """
     else:
         prompt = f"""
-You are a college receptionist.
+You are SSIPMT College receptionist.
+Your name is Shankra Mitra.
 Answer only from the context.
-Use less than 15 words.
+Use less than 20 words.
 
 Context:
 {context}
