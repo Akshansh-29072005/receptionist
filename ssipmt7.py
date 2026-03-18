@@ -16,9 +16,26 @@ from flask import Flask, jsonify, render_template_string, send_from_directory
 from flask import make_response
 import webbrowser
 import signal
+import asyncio
+import edge_tts
+import uuid
 from rag.search import search
 from rag.llm import generate_answer
 from rag.ingest import ensure_indexes
+
+import wave
+
+def validate_wav(path):
+    with wave.open(path, "rb") as w:
+        assert w.getsampwidth() == 2
+        assert w.getnchannels() == 1
+
+import subprocess
+import asyncio
+import edge_tts
+import os
+
+EDGE_VOICE_EN = "en-IN-NeerjaNeural"
 
 # ==============================
 # CONFIGURATION
@@ -269,33 +286,87 @@ def is_english_text(text):
     return ascii_words / len(words) > 0.5
 
 # ==============================
+# EDGE TTS (ENGLISH – NEERJA)
+# ==============================
+
+EDGE_VOICE_EN = "en-IN-NeerjaNeural"
+
+def edge_tts_speak(text, out_wav):
+    async def _run():
+        tmp_mp3 = out_wav.replace(".wav", ".mp3")
+
+        communicate = edge_tts.Communicate(
+            text=text,
+            voice=EDGE_VOICE_EN
+        )
+        await communicate.save(tmp_mp3)
+
+        # Convert MP3 → PCM WAV (16kHz, mono)
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-i", tmp_mp3,
+                "-ac", "1",
+                "-ar", "16000",
+                "-sample_fmt", "s16",
+                out_wav
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True
+        )
+
+        os.remove(tmp_mp3)
+
+    asyncio.run(_run())
+
+# ==============================
 # TTS (PIPER + PYGAME)
 # ==============================
 def tts_speak(text, lang, clear_after=False):
-    if not text.strip(): return
+    if not text.strip():
+        return
+
     is_speaking.set()
-    model = PRATHAM_MODEL if lang.startswith("hi") else AMY_MODEL
-    out_wav = os.path.join(BASE_DIR, "tmp_tts.wav")
+
+    # Unique temp file per request (avoids race conditions)
+    out_wav = os.path.join(BASE_DIR, f"tmp_tts_{uuid.uuid4().hex}.wav")
+
     try:
-        subprocess.run(
-            ["piper", "--model", model, "--output_file", out_wav],
-            input=text.encode("utf-8"),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True,
-        )
-        pygame.mixer.init(frequency=22050)
+        # =========================
+        # HINDI → PIPER
+        # =========================
+        if lang.startswith("hi"):
+            model = PRATHAM_MODEL
+            subprocess.run(
+                ["piper", "--model", model, "--output_file", out_wav],
+                input=text.encode("utf-8"),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True,
+            )
+
+        # =========================
+        # ENGLISH → EDGE TTS (NEERJA)
+        # =========================
+        else:
+            edge_tts_speak(text, out_wav)
+
+        # =========================
+        # PLAY AUDIO
+        # =========================
+        pygame.mixer.init(frequency=16000)
         pygame.mixer.music.load(out_wav)
         pygame.mixer.music.play()
+
         while pygame.mixer.music.get_busy() and not stop_event.is_set():
             time.sleep(0.05)
+
         pygame.mixer.quit()
 
         with state_lock:
             state["last_activity_time"] = time.time()
 
-
-        # ✅ ONLY clear if it's an answer (not greeting)
         if clear_after:
             with state_lock:
                 state.update({
@@ -308,6 +379,7 @@ def tts_speak(text, lang, clear_after=False):
 
     except Exception as e:
         print("[TTS] ERROR:", e)
+
         if clear_after:
             with state_lock:
                 state.update({
@@ -316,6 +388,7 @@ def tts_speak(text, lang, clear_after=False):
                     "last_user_text": "",
                     "last_answer_text": ""
                 })
+
     finally:
         if os.path.exists(out_wav):
             os.remove(out_wav)
@@ -332,8 +405,10 @@ def tts_worker():
                 clear_after = False  # default: don't clear (for greetings)
             tts_speak(text, lang, clear_after)
             tts_queue.task_done()
-        except:
+        except queue.Empty:
             continue
+        except Exception as e:
+            print("[TTS_WORKER] Error:", e)
 
 # ==============================
 # WAKEWORD: "Hello Robot"
